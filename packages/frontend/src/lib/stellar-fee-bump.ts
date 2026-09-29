@@ -13,7 +13,10 @@ export interface SponsoredTransactionResult {
 
 export function buildFeeBumpEnvelope(inner: Transaction, feeSource: string, baseFee = '100'): FeeBumpTransaction {
   if (!feeSource) throw new Error('A relayer fee source is required');
-  return new FeeBumpTransaction(inner, feeSource, baseFee);
+  const innerXdr = inner.toXDR();
+  const feeBump = new FeeBumpTransaction(innerXdr, feeSource);
+  feeBump.fee = baseFee;
+  return feeBump;
 }
 
 export async function requestSponsoredEnvelope(transaction: Transaction, options: { endpoint?: string; networkPassphrase: string; signal?: AbortSignal }): Promise<string> {
@@ -39,8 +42,10 @@ export async function signSponsoredEnvelope(transaction: Transaction, signer: { 
 
 export function isFeeBumpEnvelope(xdr: string): boolean {
   try {
-    FeeBumpTransaction.fromXDR(xdr, 'envelope');
-    return true;
+    // Check if the XDR contains a fee bump by looking at the envelope type
+    // A fee bump envelope has a different structure than a regular transaction
+    const parsed = JSON.parse(Buffer.from(xdr, 'base64').toString());
+    return parsed.switch?.name === 'envelopeTypeTxFeeBump';
   } catch {
     return false;
   }
