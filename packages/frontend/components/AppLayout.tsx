@@ -1,5 +1,6 @@
 import { Nav } from "@/components/nav";
 import { OfflineBanner } from "@/src/components/OfflineBanner";
+import { Header } from "@/src/components/Header";
 import { RpcHealthIndicator } from "@/src/components/RpcHealthIndicator";
 import { StakingSlipDrawer } from "@/src/components/StakingSlipDrawer";
 import { StakingSlipProvider } from "@/src/context/StakingSlipContext";
@@ -20,6 +21,7 @@ export function AppLayout({
     return (
         <StakingSlipProvider>
             <div className="min-h-screen bg-background">
+                <Header />
                 <OfflineBanner />
                 {rpcEndpoints.length > 0 ? <div className="flex justify-end px-4 py-1"><RpcHealthIndicator endpoints={rpcEndpoints} /></div> : null}
                 <div className="max-w-7xl mx-auto flex justify-center min-h-screen">
