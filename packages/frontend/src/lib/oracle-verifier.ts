@@ -43,9 +43,11 @@ function bytesToHex(value: Uint8Array): string {
 function uintBytes(value: bigint, length: number): Uint8Array {
   const bytes = new Uint8Array(length);
   let remaining = value;
+  const mask = BigInt(255);
+  const shift = BigInt(8);
   for (let index = length - 1; index >= 0; index -= 1) {
-    bytes[index] = Number(remaining & 255n);
-    remaining >>= 8n;
+    bytes[index] = Number(remaining & mask);
+    remaining >>= shift;
   }
   return bytes;
 }
@@ -75,7 +77,7 @@ export function verifyOracleEvidence(input: OracleVerificationInput): OracleVeri
     if (payloadEncoding !== 'canonical' && !input.rawPayload) throw new Error('Raw payload is required for the selected encoding');
     const message = payloadEncoding === 'hex' ? hexToBytes(input.rawPayload as string) : payloadEncoding === 'base64' ? base64ToBytes(input.rawPayload as string) : canonical;
     const signature = input.signatureEncoding === 'base64' ? base64ToBytes(input.signature) : hexToBytes(input.signature);
-    const publicKey = input.publicKey.startsWith('G') ? input.publicKey : StrKey.encodeEd25519PublicKey(hexToBytes(input.publicKey));
+    const publicKey = input.publicKey.startsWith('G') ? input.publicKey : StrKey.encodeEd25519PublicKey(Buffer.from(hexToBytes(input.publicKey)));
     const keypair = Keypair.fromPublicKey(publicKey);
     const valid = keypair.verify(message as never, signature as never);
     return { valid, canonicalPayload: bytesToHex(canonical), reason: valid ? undefined : 'Signature does not match the canonical payload' };
