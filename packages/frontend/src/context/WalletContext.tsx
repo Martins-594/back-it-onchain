@@ -80,6 +80,19 @@ export function WalletSessionProvider({ children, initialChain = 'base' }: { chi
 
 export function useWalletSessions(): WalletContextValue {
   const context = React.useContext(WalletContext);
-  if (!context) throw new Error('useWalletSessions must be used inside WalletSessionProvider');
+  if (!context) {
+    // Return default context for SSR/SSG when provider is not available
+    return {
+      sessions: { base: null, stellar: null },
+      activeChain: 'base',
+      activeSession: null,
+      tokens: { base: null, stellar: null },
+      setActiveChain: () => {},
+      setSession: () => {},
+      clearSession: () => {},
+      setToken: () => {},
+      switchChain: () => {},
+    };
+  }
   return context;
 }

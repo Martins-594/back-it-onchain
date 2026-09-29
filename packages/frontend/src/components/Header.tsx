@@ -35,7 +35,7 @@ export function Header({ className }: HeaderProps) {
           return <div key={chain} className={cn('flex items-center gap-1 rounded-full border px-2 py-1 text-xs', activeChain === chain ? 'border-primary bg-primary/10' : 'border-border')}>
             <button type="button" onClick={() => setActiveChain(chain)} className="inline-flex items-center gap-1 capitalize"><Circle className={cn('h-2.5 w-2.5', session ? 'fill-green-500 text-green-500' : 'text-muted-foreground')} />{chain}<span className="ml-1 text-muted-foreground">{short(session?.address)}</span></button>
             {session ? <button type="button" aria-label={`Copy ${chain} address`} onClick={() => void copy(chain)} className="rounded p-0.5 text-muted-foreground hover:text-foreground">{copied === chain ? <Check className="h-3 w-3 text-green-500" /> : <Copy className="h-3 w-3" />}</button> : null}
-            {session && import.meta.env.DEV ? <button type="button" aria-label={`Disconnect ${chain}`} onClick={() => clearSession(chain)} className="text-muted-foreground hover:text-red-500">×</button> : null}
+            {session && process.env.NODE_ENV === 'development' ? <button type="button" aria-label={`Disconnect ${chain}`} onClick={() => clearSession(chain)} className="text-muted-foreground hover:text-red-500">×</button> : null}
           </div>;
         })}
         <span className="rounded-full bg-secondary px-2 py-1 text-[10px] text-muted-foreground">Target: {activeChain}</span>
