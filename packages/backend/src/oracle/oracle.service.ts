@@ -1,4 +1,10 @@
-import { Injectable, Logger, Optional, ServiceUnavailableException } from '@nestjs/common';
+import {
+  Injectable,
+  Inject,
+  Logger,
+  Optional,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
@@ -7,6 +13,7 @@ import { ethers } from 'ethers';
 import { Keypair } from '@stellar/stellar-sdk';
 import * as nacl from 'tweetnacl';
 import { AdminService } from '../admin/admin.service';
+import { RedisClientProvider, IRedisClient } from '../config/redis.config';
 import { IpfsService } from '../ipfs/ipfs.service';
 import { Call } from '../calls/call.entity';
 import { AuditLog, AuditLogAction } from './audit-log.entity';
@@ -28,6 +35,13 @@ import {
   digestResolutionPayload,
 } from './key-signer';
 import { QuorumConsensusService, ResolutionPayload } from './quorum-consensus.service';
+import {
+  AggregatedPrice,
+  PriceProvider,
+  PRICE_PROVIDERS,
+  PriceQuote,
+  confidenceForProviderCount,
+} from './providers/price-provider.interface';
 
 // ─── Retry configuration ────────────────────────────────────────────────────
 
@@ -231,6 +245,22 @@ export interface QuorumOutcomeResult {
 export class OracleService {
   private readonly logger = new Logger(OracleService.name);
 
+  private readonly priceProviders: PriceProvider[];
+  private readonly redisClientProvider?: RedisClientProvider;
+  private readonly inMemoryPriceCache = new Map<
+    string,
+    { value: AggregatedPrice; expiresAt: number }
+  >();
+
+  private get redisClient(): IRedisClient | null {
+    return this.redisClientProvider?.getClient() ?? null;
+  }
+
+  private static readonly PRICE_CACHE_TTL_MS = 10_000;
+  private static readonly PRICE_CACHE_PREFIX = 'oracle:price:';
+  private static readonly MAX_QUOTE_AGE_MS = 5 * 60 * 1000;
+  private static readonly OUTLIER_DEVIATION = 0.1;
+
   private signer: ethers.Wallet;
   private stellarKeypair: Keypair;
 
@@ -252,6 +282,10 @@ export class OracleService {
   constructor(
     private configService: ConfigService,
     private adminService: AdminService,
+    @Optional() @Inject(PRICE_PROVIDERS) priceProviders?: PriceProvider[],
+    @Optional()
+    @Inject(RedisClientProvider)
+    redisClientProvider?: RedisClientProvider,
     @Optional() private readonly ipfsService?: IpfsService,
     @Optional() private readonly eventEmitter?: EventEmitter2,
     @Optional()
@@ -274,6 +308,9 @@ export class OracleService {
      */
     @Optional() private readonly auditLogService?: AuditLogService,
   ) {
+    this.priceProviders = priceProviders ?? [];
+    this.redisClientProvider = redisClientProvider;
+
     const privateKey = this.configService.get<string>('ORACLE_PRIVATE_KEY');
     if (privateKey) {
       this.signer = new ethers.Wallet(privateKey);
@@ -1184,5 +1221,175 @@ export class OracleService {
     }
 
     return this.signOutcome(callId, outcome, finalPrice, timestamp);
+  }
+
+  async getAggregatedPrice(symbol: string): Promise<AggregatedPrice | null> {
+    const key = symbol.trim().toUpperCase();
+    if (!key) return null;
+
+    const cached = await this.readAggregatedCache(key);
+    if (cached) return cached;
+
+    const settled = await Promise.allSettled(
+      this.priceProviders.map((provider) => provider.fetchQuote(key)),
+    );
+
+    const quotes: PriceQuote[] = [];
+    for (const result of settled) {
+      if (result.status === 'fulfilled' && result.value !== null) {
+        quotes.push(result.value);
+      }
+    }
+
+    const fresh = quotes.filter(
+      (quote) => Date.now() - quote.timestamp <= OracleService.MAX_QUOTE_AGE_MS,
+    );
+
+    if (fresh.length === 0) {
+      return null;
+    }
+
+    const filtered = this.rejectOutliers(fresh);
+    if (filtered.length === 0) {
+      return null;
+    }
+
+    const price = this.volumeWeightedMedian(filtered);
+    if (price === null) {
+      return null;
+    }
+
+    const aggregated: AggregatedPrice = {
+      symbol: key,
+      price,
+      sources: filtered.map((quote) => quote.source),
+      timestamp: Date.now(),
+      confidence: confidenceForProviderCount(filtered.length),
+    };
+
+    await this.writeAggregatedCache(key, aggregated);
+    return aggregated;
+  }
+
+  private rejectOutliers(quotes: PriceQuote[]): PriceQuote[] {
+    if (quotes.length < 3) {
+      return quotes;
+    }
+
+    const prices = quotes.map((quote) => quote.price).sort((a, b) => a - b);
+    const mid = prices.length >> 1;
+    const median =
+      prices.length % 2 === 1
+        ? prices[mid]
+        : (prices[mid - 1] + prices[mid]) / 2;
+
+    return quotes.filter(
+      (quote) =>
+        Math.abs(quote.price - median) / median <=
+        OracleService.OUTLIER_DEVIATION,
+    );
+  }
+
+  private volumeWeightedMedian(quotes: PriceQuote[]): number | null {
+    if (quotes.length === 0) return null;
+
+    const usable = quotes.filter(
+      (quote) => Number.isFinite(quote.price) && quote.price > 0,
+    );
+    if (usable.length === 0) return null;
+
+    const totalVolume = usable.reduce(
+      (acc, quote) => acc + Math.max(0, quote.volume24h),
+      0,
+    );
+
+    if (totalVolume <= 0) {
+      return this.simpleMedian(usable.map((quote) => quote.price));
+    }
+
+    const sorted = [...usable].sort((a, b) => a.price - b.price);
+    const half = totalVolume / 2;
+    let cumulative = 0;
+
+    for (const quote of sorted) {
+      cumulative += Math.max(0, quote.volume24h);
+      if (cumulative >= half) {
+        return quote.price;
+      }
+    }
+
+    return sorted[sorted.length - 1].price;
+  }
+
+  private simpleMedian(prices: number[]): number {
+    const sorted = [...prices].sort((a, b) => a - b);
+    const mid = sorted.length >> 1;
+    return sorted.length % 2 === 1
+      ? sorted[mid]
+      : (sorted[mid - 1] + sorted[mid]) / 2;
+  }
+
+  private async readAggregatedCache(
+    key: string,
+  ): Promise<AggregatedPrice | null> {
+    const prefixed = `${OracleService.PRICE_CACHE_PREFIX}${key}`;
+
+    const memoryEntry = this.inMemoryPriceCache.get(prefixed);
+    if (memoryEntry) {
+      if (memoryEntry.expiresAt > Date.now()) {
+        return memoryEntry.value;
+      }
+      this.inMemoryPriceCache.delete(prefixed);
+    }
+
+    if (!this.redisClient) {
+      return null;
+    }
+
+    try {
+      const raw = await this.redisClient.get(prefixed);
+      if (!raw) {
+        return null;
+      }
+      const parsed = JSON.parse(raw) as AggregatedPrice;
+      this.inMemoryPriceCache.set(prefixed, {
+        value: parsed,
+        expiresAt: Date.now() + OracleService.PRICE_CACHE_TTL_MS,
+      });
+      return parsed;
+    } catch (err) {
+      this.logger.warn(
+        `Price cache read failed for ${key}: ${(err as Error).message}`,
+      );
+      return null;
+    }
+  }
+
+  private async writeAggregatedCache(
+    key: string,
+    value: AggregatedPrice,
+  ): Promise<void> {
+    const prefixed = `${OracleService.PRICE_CACHE_PREFIX}${key}`;
+    const expiresAt = Date.now() + OracleService.PRICE_CACHE_TTL_MS;
+
+    this.inMemoryPriceCache.set(prefixed, { value, expiresAt });
+
+    if (!this.redisClient) {
+      return;
+    }
+
+    try {
+      await this.redisClient.set(
+        prefixed,
+        JSON.stringify(value),
+        'NX',
+        'PX',
+        OracleService.PRICE_CACHE_TTL_MS,
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Price cache write failed for ${key}: ${(err as Error).message}`,
+      );
+    }
   }
 }
